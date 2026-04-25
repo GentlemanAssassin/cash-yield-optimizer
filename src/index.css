@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  .form-select {
+    @apply block w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-ares-500 focus:outline-none focus:ring-1 focus:ring-ares-500 disabled:bg-gray-50 disabled:text-gray-400;
+  }
+  .form-input {
+    @apply block w-full rounded-md border border-gray-300 px-3 py-2 text-sm shadow-sm focus:border-ares-500 focus:outline-none focus:ring-1 focus:ring-ares-500;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background-color: #f5f7fb;
+  color: #1f2937;
+}
