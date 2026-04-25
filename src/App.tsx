@@ -137,8 +137,9 @@ export default function App() {
               onClick={handleRefresh}
               disabled={refreshing || !hasKey}
               className="rounded-md bg-ares-500 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-ares-600 disabled:opacity-50"
+              title={refreshing ? "Refresh runs sequentially across custodians and may take ~40 seconds" : ""}
             >
-              {refreshing ? "Refreshing..." : "Refresh yields"}
+              {refreshing ? "Refreshing (~40s)..." : "Refresh yields"}
             </button>
             <button
               type="button"

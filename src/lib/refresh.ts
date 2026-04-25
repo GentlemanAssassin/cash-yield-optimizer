@@ -7,7 +7,20 @@ import { FUNDS } from "../data/funds";
 import type { Fund } from "../data/funds";
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-const MODEL = "claude-sonnet-4-6";
+// Haiku has higher input-token-per-minute limits than Sonnet on Tier 1
+// (50K vs 10K TPM as of 2026-04). For ticker -> yield extraction the speed
+// and rate-limit headroom matter more than the marginal accuracy gain.
+const MODEL = "claude-haiku-4-5-20251001";
+
+// Spacing between sequential custodian calls (ms). Helps stay under the
+// per-minute input-token rate limit when web_search returns large result blocks.
+const INTER_CALL_DELAY_MS = 8000;
+// Max retries on 429 rate-limit errors per custodian call.
+const MAX_429_RETRIES = 3;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export interface RefreshResult {
   yields: Record<string, number>;
@@ -76,7 +89,9 @@ async function callClaudeForCustodian(
       {
         type: "web_search_20250305",
         name: "web_search",
-        max_uses: 5,
+        // Lower max_uses to keep input tokens (search result blocks) under the
+        // per-minute rate limit. 2 searches is usually enough for one custodian.
+        max_uses: 2,
       },
     ],
     messages: [
@@ -87,20 +102,31 @@ async function callClaudeForCustodian(
     ],
   };
 
-  const res = await fetch(ANTHROPIC_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify(body),
-  });
+  let res: Response | null = null;
+  for (let attempt = 0; attempt <= MAX_429_RETRIES; attempt++) {
+    res = await fetch(ANTHROPIC_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.status !== 429) break;
+    if (attempt === MAX_429_RETRIES) break;
+    // Respect Retry-After header if present, otherwise exponential backoff.
+    const retryAfter = Number(res.headers.get("retry-after"));
+    const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+      ? retryAfter * 1000
+      : Math.min(60000, 8000 * Math.pow(2, attempt));
+    await sleep(waitMs);
+  }
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Anthropic API ${res.status}: ${errText.slice(0, 300)}`);
+  if (!res || !res.ok) {
+    const errText = res ? await res.text().catch(() => "") : "no response";
+    throw new Error(`Anthropic API ${res?.status ?? "?"}: ${errText.slice(0, 300)}`);
   }
 
   const data = (await res.json()) as AnthropicResponse;
@@ -203,28 +229,29 @@ function sanitize(obj: Record<string, unknown>): Record<string, number> {
 
 /**
  * Refresh yields for every fund in the universe, batched by custodian.
- * Resolves all batches in parallel.
+ * Runs SEQUENTIALLY with a delay between calls to stay under the
+ * per-minute input-token rate limit when web_search returns large blocks.
  */
 export async function refreshAllYields(apiKey: string): Promise<RefreshResult> {
   const groups = groupByCustodian(FUNDS);
   const warnings: string[] = [];
-
-  const results = await Promise.allSettled(
-    Object.entries(groups).map(async ([custodian, funds]) => {
-      try {
-        const { yields, warning } = await callClaudeForCustodian(apiKey, custodian, funds);
-        if (warning) warnings.push(warning);
-        return yields;
-      } catch (e) {
-        warnings.push(`${custodian}: ${(e as Error).message}`);
-        return {} as Record<string, number>;
-      }
-    }),
-  );
-
   const merged: Record<string, number> = {};
-  for (const r of results) {
-    if (r.status === "fulfilled") Object.assign(merged, r.value);
+
+  const entries = Object.entries(groups);
+  for (let i = 0; i < entries.length; i++) {
+    const [custodian, funds] = entries[i];
+    try {
+      const { yields, warning } = await callClaudeForCustodian(apiKey, custodian, funds);
+      if (warning) warnings.push(warning);
+      Object.assign(merged, yields);
+    } catch (e) {
+      warnings.push(`${custodian}: ${(e as Error).message}`);
+    }
+    // Throttle between calls to spread input-token usage across the per-minute
+    // window. Skip the wait after the last call.
+    if (i < entries.length - 1) {
+      await sleep(INTER_CALL_DELAY_MS);
+    }
   }
 
   return {
