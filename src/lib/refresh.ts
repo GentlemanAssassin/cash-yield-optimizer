@@ -47,14 +47,15 @@ function buildPrompt(custodian: string, funds: Fund[]): string {
             : "the issuer's website (e.g. wisdomtree.com for USFR)"
     } as the primary source. Cross-reference with morningstar.com or marketwatch.com if needed.`,
     "",
-    "Return ONLY a JSON object mapping each ticker symbol to its 7-day yield as a number (no percent sign).",
-    'Example format: {"FZDXX": 4.85, "SPRXX": 4.72}',
+    "Your final message must be a single JSON object mapping each ticker symbol to its 7-day yield as a number (no percent sign).",
+    'Required exact format: {"FZDXX": 4.85, "SPRXX": 4.72}',
     "",
     "Rules:",
     "- Use 7-day SEC yield, not 30-day or distribution yield. For ETFs that don't publish a 7-day yield, use the 30-day SEC yield.",
     "- Numbers as decimals (4.85 means 4.85%). No percent signs.",
     "- If a yield can't be found, omit that ticker from the response. Don't guess.",
-    "- Output strictly valid JSON only. No prose, no markdown fences.",
+    "- Your final response message must contain ONLY the JSON object. No prose, no commentary, no markdown code fences, no headers, no explanation. Just the raw JSON.",
+    "- It is fine to think out loud and search the web during intermediate steps, but the very last message you produce must be only the JSON.",
   ].join("\n");
 }
 
@@ -103,55 +104,98 @@ async function callClaudeForCustodian(
   }
 
   const data = (await res.json()) as AnthropicResponse;
-  const textBlock = data.content?.find((b) => b.type === "text" && typeof b.text === "string");
-  if (!textBlock?.text) {
+  // With the web_search tool, the response contains multiple text blocks
+  // interleaved with tool_use / tool_result blocks. The LAST text block is the
+  // final answer; earlier ones are reasoning between searches. We try the last
+  // first, then fall back to concatenating all text blocks.
+  const textBlocks = (data.content ?? []).filter(
+    (b) => b.type === "text" && typeof b.text === "string",
+  );
+  if (textBlocks.length === 0) {
     return { yields: {}, warning: `${custodian}: no text in response` };
   }
 
-  const parsed = parseYieldJson(textBlock.text);
-  if (!parsed) {
-    return { yields: {}, warning: `${custodian}: could not parse JSON from response` };
+  const lastText = textBlocks[textBlocks.length - 1].text!;
+  let parsed = parseYieldJson(lastText);
+  if (!parsed || Object.keys(parsed).length === 0) {
+    const concatenated = textBlocks.map((b) => b.text).join("\n\n");
+    parsed = parseYieldJson(concatenated);
+  }
+  if (!parsed || Object.keys(parsed).length === 0) {
+    return {
+      yields: {},
+      warning: `${custodian}: could not parse JSON from response (response started with: ${lastText.slice(0, 120).replace(/\s+/g, " ")})`,
+    };
   }
   return { yields: parsed };
 }
 
 /**
  * Extract the JSON object from Claude's response. Tolerates leading/trailing
- * prose and code fences just in case.
+ * prose, markdown code fences, and one level of nesting (e.g. {"yields": {...}}).
  */
 function parseYieldJson(text: string): Record<string, number> | null {
+  // Strip markdown code fences if present.
+  const stripped = text
+    .replace(/```(?:json)?\s*/gi, "")
+    .replace(/```/g, "")
+    .trim();
+
   // Try direct parse first.
-  try {
-    const obj = JSON.parse(text);
-    if (obj && typeof obj === "object") return sanitize(obj);
-  } catch {
-    /* fall through */
+  const direct = tryParseAndExtract(stripped);
+  if (direct && Object.keys(direct).length > 0) return direct;
+
+  // Look for the first { ... } block. Prefer a tight match by finding balanced
+  // braces from the first `{`.
+  const firstBrace = stripped.indexOf("{");
+  if (firstBrace === -1) return null;
+
+  // Try every closing-brace position from the end working backwards. The
+  // greedy-then-shrink approach handles cases where prose contains stray braces.
+  for (let end = stripped.length; end > firstBrace; end--) {
+    if (stripped[end - 1] !== "}") continue;
+    const candidate = stripped.slice(firstBrace, end);
+    const obj = tryParseAndExtract(candidate);
+    if (obj && Object.keys(obj).length > 0) return obj;
   }
-  // Look for the first { ... } block.
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) return null;
+  return null;
+}
+
+function tryParseAndExtract(s: string): Record<string, number> | null {
   try {
-    const obj = JSON.parse(match[0]);
-    if (obj && typeof obj === "object") return sanitize(obj);
+    const parsed = JSON.parse(s);
+    if (!parsed || typeof parsed !== "object") return null;
+    // Direct ticker -> yield map.
+    const direct = sanitize(parsed as Record<string, unknown>);
+    if (Object.keys(direct).length > 0) return direct;
+    // Maybe nested under a wrapper key like {"yields": {...}}. Try one level.
+    for (const v of Object.values(parsed as Record<string, unknown>)) {
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        const nested = sanitize(v as Record<string, unknown>);
+        if (Object.keys(nested).length > 0) return nested;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
-  return null;
 }
 
 function sanitize(obj: Record<string, unknown>): Record<string, number> {
   const out: Record<string, number> = {};
   for (const [k, v] of Object.entries(obj)) {
+    // Keys must look like a ticker (3-5 uppercase letters/digits).
+    const key = k.toUpperCase().trim();
+    if (!/^[A-Z0-9]{2,6}$/.test(key)) continue;
     let n: number | null = null;
     if (typeof v === "number") n = v;
     else if (typeof v === "string") {
-      const cleaned = v.replace("%", "").trim();
+      const cleaned = v.replace(/%/g, "").trim();
       const parsed = Number(cleaned);
       if (Number.isFinite(parsed)) n = parsed;
     }
     if (n !== null && n >= 0 && n < 30) {
-      // Sanity bound: yields above 30% are almost certainly bogus.
-      out[k.toUpperCase()] = n;
+      out[key] = n;
     }
   }
   return out;
